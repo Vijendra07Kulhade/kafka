@@ -18,11 +18,19 @@ package org.apache.kafka.connect.runtime;
 
 import org.apache.kafka.connect.connector.Connector;
 import org.apache.kafka.connect.connector.ConnectorContext;
+import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.runtime.ConnectMetrics.MetricGroup;
 import org.apache.kafka.connect.sink.SinkConnector;
+import org.apache.kafka.connect.source.SourceConnector;
+import org.apache.kafka.connect.sink.SinkConnectorContext;
+import org.apache.kafka.connect.source.SourceConnectorContext;
+import org.apache.kafka.connect.storage.OffsetStorageReader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * Container for connectors which is responsible for managing their lifecycle (e.g. handling startup,
@@ -50,39 +58,40 @@ public class WorkerConnector {
     private final ConnectorStatus.Listener statusListener;
     private final ConnectorContext ctx;
     private final Connector connector;
+    private final ConnectorMetricsGroup metrics;
 
     private Map<String, String> config;
     private State state;
+    private final OffsetStorageReader offsetStorageReader;
 
     public WorkerConnector(String connName,
                            Connector connector,
                            ConnectorContext ctx,
-                           ConnectorStatus.Listener statusListener) {
+                           ConnectMetrics metrics,
+                           ConnectorStatus.Listener statusListener,
+                           OffsetStorageReader offsetStorageReader) {
         this.connName = connName;
         this.ctx = ctx;
         this.connector = connector;
-        this.statusListener = statusListener;
         this.state = State.INIT;
+        this.metrics = new ConnectorMetricsGroup(metrics, AbstractStatus.State.UNASSIGNED, statusListener);
+        this.statusListener = this.metrics;
+        this.offsetStorageReader = offsetStorageReader;
     }
 
     public void initialize(ConnectorConfig connectorConfig) {
         try {
+            if (!isSourceConnector() && !isSinkConnector()) {
+                throw new ConnectException("Connector implementations must be a subclass of either SourceConnector or SinkConnector");
+            }
             this.config = connectorConfig.originalsStrings();
-            log.debug("{} Initializing connector {} with config {}", this, connName, config);
-
-            connector.initialize(new ConnectorContext() {
-                @Override
-                public void requestTaskReconfiguration() {
-                    ctx.requestTaskReconfiguration();
-                }
-
-                @Override
-                public void raiseError(Exception e) {
-                    log.error("{} Connector raised an error", this, e);
-                    onFailure(e);
-                    ctx.raiseError(e);
-                }
-            });
+            log.debug("{} Initializing connector {}", this, connName);
+            if (isSinkConnector()) {
+                SinkConnectorConfig.validate(config);
+                connector.initialize(new WorkerSinkConnectorContext());
+            } else {
+                connector.initialize(new WorkerSourceConnectorContext(offsetStorageReader));
+            }
         } catch (Throwable t) {
             log.error("{} Error initializing connector", this, t);
             onFailure(t);
@@ -130,6 +139,7 @@ public class WorkerConnector {
         return state == State.STARTED;
     }
 
+    @SuppressWarnings("fallthrough")
     private void pause() {
         try {
             switch (state) {
@@ -160,11 +170,13 @@ public class WorkerConnector {
             if (state == State.STARTED)
                 connector.stop();
             this.state = State.STOPPED;
+            statusListener.onShutdown(connName);
         } catch (Throwable t) {
             log.error("{} Error while shutting down connector", this, t);
             this.state = State.FAILED;
+            statusListener.onFailure(connName, t);
         } finally {
-            statusListener.onShutdown(connName);
+            metrics.close();
         }
     }
 
@@ -191,14 +203,151 @@ public class WorkerConnector {
         return SinkConnector.class.isAssignableFrom(connector.getClass());
     }
 
+    public boolean isSourceConnector() {
+        return SourceConnector.class.isAssignableFrom(connector.getClass());
+    }
+
+    protected String connectorType() {
+        if (isSinkConnector())
+            return "sink";
+        if (isSourceConnector())
+            return "source";
+        return "unknown";
+    }
+
     public Connector connector() {
         return connector;
+    }
+
+    ConnectorMetricsGroup metrics() {
+        return metrics;
     }
 
     @Override
     public String toString() {
         return "WorkerConnector{" +
-                "id=" + connName +
-                '}';
+                       "id=" + connName +
+                       '}';
+    }
+
+    class ConnectorMetricsGroup implements ConnectorStatus.Listener, AutoCloseable {
+        /**
+         * Use {@link AbstractStatus.State} since it has all of the states we want,
+         * unlike {@link WorkerConnector.State}.
+         */
+        private volatile AbstractStatus.State state;
+        private final MetricGroup metricGroup;
+        private final ConnectorStatus.Listener delegate;
+
+        public ConnectorMetricsGroup(ConnectMetrics connectMetrics, AbstractStatus.State initialState, ConnectorStatus.Listener delegate) {
+            Objects.requireNonNull(connectMetrics);
+            Objects.requireNonNull(connector);
+            Objects.requireNonNull(initialState);
+            Objects.requireNonNull(delegate);
+            this.delegate = delegate;
+            this.state = initialState;
+            ConnectMetricsRegistry registry = connectMetrics.registry();
+            this.metricGroup = connectMetrics.group(registry.connectorGroupName(),
+                    registry.connectorTagName(), connName);
+            // prevent collisions by removing any previously created metrics in this group.
+            metricGroup.close();
+
+            metricGroup.addImmutableValueMetric(registry.connectorType, connectorType());
+            metricGroup.addImmutableValueMetric(registry.connectorClass, connector.getClass().getName());
+            metricGroup.addImmutableValueMetric(registry.connectorVersion, connector.version());
+            metricGroup.addValueMetric(registry.connectorStatus, now -> state.toString().toLowerCase(Locale.getDefault()));
+        }
+
+        public void close() {
+            metricGroup.close();
+        }
+
+        @Override
+        public void onStartup(String connector) {
+            state = AbstractStatus.State.RUNNING;
+            delegate.onStartup(connector);
+        }
+
+        @Override
+        public void onShutdown(String connector) {
+            state = AbstractStatus.State.UNASSIGNED;
+            delegate.onShutdown(connector);
+        }
+
+        @Override
+        public void onPause(String connector) {
+            state = AbstractStatus.State.PAUSED;
+            delegate.onPause(connector);
+        }
+
+        @Override
+        public void onResume(String connector) {
+            state = AbstractStatus.State.RUNNING;
+            delegate.onResume(connector);
+        }
+
+        @Override
+        public void onFailure(String connector, Throwable cause) {
+            state = AbstractStatus.State.FAILED;
+            delegate.onFailure(connector, cause);
+        }
+
+        @Override
+        public void onDeletion(String connector) {
+            state = AbstractStatus.State.DESTROYED;
+            delegate.onDeletion(connector);
+        }
+
+        boolean isUnassigned() {
+            return state == AbstractStatus.State.UNASSIGNED;
+        }
+
+        boolean isRunning() {
+            return state == AbstractStatus.State.RUNNING;
+        }
+
+        boolean isPaused() {
+            return state == AbstractStatus.State.PAUSED;
+        }
+
+        boolean isFailed() {
+            return state == AbstractStatus.State.FAILED;
+        }
+
+        protected MetricGroup metricGroup() {
+            return metricGroup;
+        }
+    }
+
+    private abstract class WorkerConnectorContext implements ConnectorContext {
+
+        @Override
+        public void requestTaskReconfiguration() {
+            WorkerConnector.this.ctx.requestTaskReconfiguration();
+        }
+
+        @Override
+        public void raiseError(Exception e) {
+            log.error("{} Connector raised an error", WorkerConnector.this, e);
+            onFailure(e);
+            WorkerConnector.this.ctx.raiseError(e);
+        }
+    }
+
+    private class WorkerSinkConnectorContext extends WorkerConnectorContext implements SinkConnectorContext {
+    }
+
+    private class WorkerSourceConnectorContext extends WorkerConnectorContext implements SourceConnectorContext {
+
+        private final OffsetStorageReader offsetStorageReader;
+
+        WorkerSourceConnectorContext(OffsetStorageReader offsetStorageReader) {
+            this.offsetStorageReader = offsetStorageReader;
+        }
+
+        @Override
+        public OffsetStorageReader offsetStorageReader() {
+            return offsetStorageReader;
+        }
     }
 }

@@ -18,7 +18,7 @@ package org.apache.kafka.test;
 
 
 import org.apache.kafka.common.serialization.Deserializer;
-import org.apache.kafka.streams.processor.ProcessorContext;
+import org.apache.kafka.streams.processor.internals.InternalProcessorContext;
 import org.apache.kafka.streams.processor.internals.SourceNode;
 
 import java.util.ArrayList;
@@ -27,8 +27,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 public class MockSourceNode<K, V> extends SourceNode<K, V> {
 
-    public static final String NAME = "MOCK-SOURCE-";
-    public static final AtomicInteger INDEX = new AtomicInteger(1);
+    private static final String NAME = "MOCK-SOURCE-";
+    private static final AtomicInteger INDEX = new AtomicInteger(1);
 
     public int numReceived = 0;
     public final ArrayList<K> keys = new ArrayList<>();
@@ -36,19 +36,19 @@ public class MockSourceNode<K, V> extends SourceNode<K, V> {
     public boolean initialized;
     public boolean closed;
 
-    public MockSourceNode(String[] topics, Deserializer<K> keyDeserializer, Deserializer<V> valDeserializer) {
+    public MockSourceNode(final String[] topics, final Deserializer<K> keyDeserializer, final Deserializer<V> valDeserializer) {
         super(NAME + INDEX.getAndIncrement(), Arrays.asList(topics), keyDeserializer, valDeserializer);
     }
 
     @Override
-    public void process(K key, V value) {
+    public void process(final K key, final V value) {
         this.numReceived++;
         this.keys.add(key);
         this.values.add(value);
     }
 
     @Override
-    public void init(final ProcessorContext context) {
+    public void init(final InternalProcessorContext context) {
         super.init(context);
         initialized = true;
     }

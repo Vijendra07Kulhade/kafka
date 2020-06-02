@@ -28,95 +28,92 @@ import org.apache.kafka.streams.processor.Processor;
 import org.apache.kafka.streams.processor.ProcessorContext;
 import org.apache.kafka.streams.processor.ProcessorSupplier;
 
-import java.io.File;
+import java.time.Instant;
 
 public class SmokeTestUtil {
 
     final static int END = Integer.MAX_VALUE;
 
     static ProcessorSupplier<Object, Object> printProcessorSupplier(final String topic) {
-        return printProcessorSupplier(topic, false);
+        return printProcessorSupplier(topic, "");
     }
 
-    private static ProcessorSupplier<Object, Object> printProcessorSupplier(final String topic, final boolean printOffset) {
+    static ProcessorSupplier<Object, Object> printProcessorSupplier(final String topic, final String name) {
         return new ProcessorSupplier<Object, Object>() {
             @Override
             public Processor<Object, Object> get() {
                 return new AbstractProcessor<Object, Object>() {
                     private int numRecordsProcessed = 0;
-                    private ProcessorContext context;
+                    private long smallestOffset = Long.MAX_VALUE;
+                    private long largestOffset = Long.MIN_VALUE;
 
                     @Override
                     public void init(final ProcessorContext context) {
-                        System.out.println("initializing processor: topic=" + topic + " taskId=" + context.taskId());
+                        super.init(context);
+                        System.out.println("[DEV] initializing processor: topic=" + topic + " taskId=" + context.taskId());
+                        System.out.flush();
                         numRecordsProcessed = 0;
-                        this.context = context;
+                        smallestOffset = Long.MAX_VALUE;
+                        largestOffset = Long.MIN_VALUE;
                     }
 
                     @Override
                     public void process(final Object key, final Object value) {
-                        if (printOffset) {
-                            System.out.println(">>> " + context.offset());
-                        }
                         numRecordsProcessed++;
                         if (numRecordsProcessed % 100 == 0) {
+                            System.out.printf("%s: %s%n", name, Instant.now());
                             System.out.println("processed " + numRecordsProcessed + " records from topic=" + topic);
+                        }
+
+                        if (smallestOffset > context().offset()) {
+                            smallestOffset = context().offset();
+                        }
+                        if (largestOffset < context().offset()) {
+                            largestOffset = context().offset();
                         }
                     }
 
                     @Override
-                    public void punctuate(final long timestamp) { }
-
-                    @Override
-                    public void close() { }
+                    public void close() {
+                        System.out.printf("Close processor for task %s", context().taskId());
+                        System.out.println("processed " + numRecordsProcessed + " records");
+                        final long processed;
+                        if (largestOffset >= smallestOffset) {
+                            processed = 1L + largestOffset - smallestOffset;
+                        } else {
+                            processed = 0L;
+                        }
+                        System.out.println("offset " + smallestOffset + " to " + largestOffset + " -> processed " + processed);
+                        System.out.flush();
+                    }
                 };
             }
         };
     }
 
-    public static final class Unwindow<K, V> implements KeyValueMapper<Windowed<K>, V, KeyValue<K, V>> {
+    public static final class Unwindow<K, V> implements KeyValueMapper<Windowed<K>, V, K> {
         @Override
-        public KeyValue<K, V> apply(final Windowed<K> winKey, final V value) {
-            return new KeyValue<>(winKey.key(), value);
+        public K apply(final Windowed<K> winKey, final V value) {
+            return winKey.key();
         }
     }
 
     public static class Agg {
 
         KeyValueMapper<String, Long, KeyValue<String, Long>> selector() {
-            return new KeyValueMapper<String, Long, KeyValue<String, Long>>() {
-                @Override
-                public KeyValue<String, Long> apply(final String key, final Long value) {
-                    return new KeyValue<>(value == null ? null : Long.toString(value), 1L);
-                }
-            };
+            return (key, value) -> new KeyValue<>(value == null ? null : Long.toString(value), 1L);
         }
 
         public Initializer<Long> init() {
-            return new Initializer<Long>() {
-                @Override
-                public Long apply() {
-                    return 0L;
-                }
-            };
+            return () -> 0L;
         }
 
         Aggregator<String, Long, Long> adder() {
-            return new Aggregator<String, Long, Long>() {
-                @Override
-                public Long apply(final String aggKey, final Long value, final Long aggregate) {
-                    return aggregate + value;
-                }
-            };
+            return (aggKey, value, aggregate) -> aggregate + value;
         }
 
         Aggregator<String, Long, Long> remover() {
-            return new Aggregator<String, Long, Long>() {
-                @Override
-                public Long apply(final String aggKey, final Long value, final Long aggregate) {
-                    return aggregate - value;
-                }
-            };
+            return (aggKey, value, aggregate) -> aggregate - value;
         }
     }
 
@@ -127,14 +124,6 @@ public class SmokeTestUtil {
     static Serde<Long> longSerde = Serdes.Long();
 
     static Serde<Double> doubleSerde = Serdes.Double();
-
-    static File createDir(final File parent, final String child) throws Exception {
-        final File dir = new File(parent, child);
-
-        dir.mkdir();
-
-        return dir;
-    }
 
     public static void sleep(final long duration) {
         try {

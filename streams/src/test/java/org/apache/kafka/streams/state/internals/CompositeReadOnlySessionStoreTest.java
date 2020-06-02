@@ -17,10 +17,13 @@
 package org.apache.kafka.streams.state.internals;
 
 import org.apache.kafka.streams.KeyValue;
+import org.apache.kafka.streams.StoreQueryParameters;
 import org.apache.kafka.streams.errors.InvalidStateStoreException;
 import org.apache.kafka.streams.kstream.Windowed;
 import org.apache.kafka.streams.kstream.internals.SessionWindow;
+import org.apache.kafka.streams.state.ReadOnlySessionStore;
 import org.apache.kafka.streams.state.KeyValueIterator;
+import org.apache.kafka.streams.state.QueryableStoreType;
 import org.apache.kafka.streams.state.QueryableStoreTypes;
 import org.apache.kafka.test.ReadOnlySessionStoreStub;
 import org.apache.kafka.test.StateStoreProviderStub;
@@ -29,9 +32,9 @@ import org.junit.Before;
 import org.junit.Test;
 
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.List;
 
+import static java.util.Collections.singletonList;
 import static org.apache.kafka.test.StreamsTestUtils.toList;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.core.IsEqual.equalTo;
@@ -52,15 +55,15 @@ public class CompositeReadOnlySessionStoreTest {
     public void before() {
         stubProviderOne.addStore(storeName, underlyingSessionStore);
         stubProviderOne.addStore("other-session-store", otherUnderlyingStore);
-
+        final QueryableStoreType<ReadOnlySessionStore<Object, Object>> queryableStoreType = QueryableStoreTypes.sessionStore();
 
         sessionStore = new CompositeReadOnlySessionStore<>(
-                new WrappingStoreProvider(Arrays.<StateStoreProvider>asList(stubProviderOne, stubProviderTwo)),
-                QueryableStoreTypes.<String, Long>sessionStore(), storeName);
+            new WrappingStoreProvider(Arrays.asList(stubProviderOne, stubProviderTwo), StoreQueryParameters.fromNameAndType(storeName, queryableStoreType)),
+            QueryableStoreTypes.sessionStore(), storeName);
     }
 
     @Test
-    public void shouldFetchResulstFromUnderlyingSessionStore() throws Exception {
+    public void shouldFetchResulstFromUnderlyingSessionStore() {
         underlyingSessionStore.put(new Windowed<>("a", new SessionWindow(0, 0)), 1L);
         underlyingSessionStore.put(new Windowed<>("a", new SessionWindow(10, 10)), 2L);
 
@@ -71,13 +74,13 @@ public class CompositeReadOnlySessionStoreTest {
     }
 
     @Test
-    public void shouldReturnEmptyIteratorIfNoData() throws Exception {
+    public void shouldReturnEmptyIteratorIfNoData() {
         final KeyValueIterator<Windowed<String>, Long> result = sessionStore.fetch("b");
         assertFalse(result.hasNext());
     }
 
     @Test
-    public void shouldFindValueForKeyWhenMultiStores() throws Exception {
+    public void shouldFindValueForKeyWhenMultiStores() {
         final ReadOnlySessionStoreStub<String, Long> secondUnderlying = new
                 ReadOnlySessionStoreStub<>();
         stubProviderTwo.addStore(storeName, secondUnderlying);
@@ -90,12 +93,12 @@ public class CompositeReadOnlySessionStoreTest {
         final List<KeyValue<Windowed<String>, Long>> keyOneResults = toList(sessionStore.fetch("key-one"));
         final List<KeyValue<Windowed<String>, Long>> keyTwoResults = toList(sessionStore.fetch("key-two"));
 
-        assertEquals(Collections.singletonList(KeyValue.pair(keyOne, 0L)), keyOneResults);
-        assertEquals(Collections.singletonList(KeyValue.pair(keyTwo, 10L)), keyTwoResults);
+        assertEquals(singletonList(KeyValue.pair(keyOne, 0L)), keyOneResults);
+        assertEquals(singletonList(KeyValue.pair(keyTwo, 10L)), keyTwoResults);
     }
 
     @Test
-    public void shouldNotGetValueFromOtherStores() throws Exception {
+    public void shouldNotGetValueFromOtherStores() {
         final Windowed<String> expectedKey = new Windowed<>("foo", new SessionWindow(0, 0));
         otherUnderlyingStore.put(new Windowed<>("foo", new SessionWindow(10, 10)), 10L);
         underlyingSessionStore.put(expectedKey, 1L);
@@ -106,11 +109,14 @@ public class CompositeReadOnlySessionStoreTest {
     }
 
     @Test(expected = InvalidStateStoreException.class)
-    public void shouldThrowInvalidStateStoreExceptionOnRebalance() throws Exception {
-        final CompositeReadOnlySessionStore<String, String> store
-                = new CompositeReadOnlySessionStore<>(new StateStoreProviderStub(true),
-                                                      QueryableStoreTypes.<String, String>sessionStore(),
-                                                      "whateva");
+    public void shouldThrowInvalidStateStoreExceptionOnRebalance() {
+        final QueryableStoreType<ReadOnlySessionStore<Object, Object>> queryableStoreType = QueryableStoreTypes.sessionStore();
+        final CompositeReadOnlySessionStore<String, String> store =
+            new CompositeReadOnlySessionStore<>(
+                new WrappingStoreProvider(singletonList(new StateStoreProviderStub(true)), StoreQueryParameters.fromNameAndType("whateva", queryableStoreType)),
+                QueryableStoreTypes.sessionStore(),
+                "whateva"
+            );
 
         store.fetch("a");
     }
@@ -121,7 +127,7 @@ public class CompositeReadOnlySessionStoreTest {
         try {
             sessionStore.fetch("key");
             fail("Should have thrown InvalidStateStoreException with session store");
-        } catch (InvalidStateStoreException e) { }
+        } catch (final InvalidStateStoreException e) { }
     }
 
     @Test(expected = NullPointerException.class)

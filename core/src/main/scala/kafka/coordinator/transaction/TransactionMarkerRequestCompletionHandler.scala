@@ -20,11 +20,11 @@ package kafka.coordinator.transaction
 import kafka.utils.Logging
 import org.apache.kafka.clients.{ClientResponse, RequestCompletionHandler}
 import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.protocol.{ApiKeys, Errors}
+import org.apache.kafka.common.protocol.Errors
 import org.apache.kafka.common.requests.WriteTxnMarkersResponse
 
 import scala.collection.mutable
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 class TransactionMarkerRequestCompletionHandler(brokerId: Int,
                                                 txnStateManager: TransactionStateManager,
@@ -37,9 +37,7 @@ class TransactionMarkerRequestCompletionHandler(brokerId: Int,
     val requestHeader = response.requestHeader
     val correlationId = requestHeader.correlationId
     if (response.wasDisconnected) {
-      val api = ApiKeys.forId(requestHeader.apiKey)
-      val correlation = requestHeader.correlationId
-      trace(s"Cancelled $api request $requestHeader with correlation id $correlation due to node ${response.destination} being disconnected")
+      trace(s"Cancelled request with header $requestHeader due to node ${response.destination} being disconnected")
 
       for (txnIdAndMarker <- txnIdAndMarkerEntries.asScala) {
         val transactionalId = txnIdAndMarker.txnId
@@ -131,7 +129,7 @@ class TransactionMarkerRequestCompletionHandler(brokerId: Int,
               txnMarkerChannelManager.removeMarkersForTxnId(transactionalId)
               abortSending = true
             } else {
-              txnMetadata synchronized {
+              txnMetadata.inLock {
                 for ((topicPartition, error) <- errors.asScala) {
                   error match {
                     case Errors.NONE =>
@@ -148,7 +146,8 @@ class TransactionMarkerRequestCompletionHandler(brokerId: Int,
                          Errors.NOT_LEADER_FOR_PARTITION |
                          Errors.NOT_ENOUGH_REPLICAS |
                          Errors.NOT_ENOUGH_REPLICAS_AFTER_APPEND |
-                         Errors.REQUEST_TIMED_OUT => // these are retriable errors
+                         Errors.REQUEST_TIMED_OUT |
+                         Errors.KAFKA_STORAGE_ERROR => // these are retriable errors
 
                       info(s"Sending $transactionalId's transaction marker for partition $topicPartition has failed with error ${error.exceptionName}, retrying " +
                         s"with current coordinator epoch ${epochAndMetadata.coordinatorEpoch}")

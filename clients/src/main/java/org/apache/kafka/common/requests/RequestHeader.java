@@ -16,8 +16,11 @@
  */
 package org.apache.kafka.common.requests;
 
-import org.apache.kafka.common.protocol.Protocol;
-import org.apache.kafka.common.protocol.types.Schema;
+import org.apache.kafka.common.errors.InvalidRequestException;
+import org.apache.kafka.common.errors.UnsupportedVersionException;
+import org.apache.kafka.common.message.RequestHeaderData;
+import org.apache.kafka.common.protocol.ApiKeys;
+import org.apache.kafka.common.protocol.ByteBufferAccessor;
 import org.apache.kafka.common.protocol.types.Struct;
 
 import java.nio.ByteBuffer;
@@ -25,101 +28,97 @@ import java.nio.ByteBuffer;
 /**
  * The header for a request in the Kafka protocol
  */
-public class RequestHeader extends AbstractRequestResponse {
-    private static final String API_KEY_FIELD_NAME = "api_key";
-    private static final String API_VERSION_FIELD_NAME = "api_version";
-    private static final String CLIENT_ID_FIELD_NAME = "client_id";
-    private static final String CORRELATION_ID_FIELD_NAME = "correlation_id";
+public class RequestHeader implements AbstractRequestResponse {
+    private final RequestHeaderData data;
+    private final short headerVersion;
 
-    private final short apiKey;
-    private final short apiVersion;
-    private final String clientId;
-    private final int correlationId;
-
-    public RequestHeader(Struct struct) {
-        apiKey = struct.getShort(API_KEY_FIELD_NAME);
-        apiVersion = struct.getShort(API_VERSION_FIELD_NAME);
-
-        // only v0 of the controlled shutdown request is missing the clientId
-        if (struct.hasField(CLIENT_ID_FIELD_NAME))
-            clientId = struct.getString(CLIENT_ID_FIELD_NAME);
-        else
-            clientId = "";
-        correlationId = struct.getInt(CORRELATION_ID_FIELD_NAME);
+    public RequestHeader(Struct struct, short headerVersion) {
+        this(new RequestHeaderData(struct, headerVersion), headerVersion);
     }
 
-    public RequestHeader(short apiKey, short version, String clientId, int correlation) {
-        this.apiKey = apiKey;
-        this.apiVersion = version;
-        this.clientId = clientId;
-        this.correlationId = correlation;
+    public RequestHeader(ApiKeys requestApiKey, short requestVersion, String clientId, int correlationId) {
+        this(new RequestHeaderData().
+                setRequestApiKey(requestApiKey.id).
+                setRequestApiVersion(requestVersion).
+                setClientId(clientId).
+                setCorrelationId(correlationId),
+            ApiKeys.forId(requestApiKey.id).requestHeaderVersion(requestVersion));
+    }
+
+    public RequestHeader(RequestHeaderData data, short headerVersion) {
+        this.data = data;
+        this.headerVersion = headerVersion;
     }
 
     public Struct toStruct() {
-        Schema schema = Protocol.requestHeaderSchema(apiKey, apiVersion);
-        Struct struct = new Struct(schema);
-        struct.set(API_KEY_FIELD_NAME, apiKey);
-        struct.set(API_VERSION_FIELD_NAME, apiVersion);
-
-        // only v0 of the controlled shutdown request is missing the clientId
-        if (struct.hasField(CLIENT_ID_FIELD_NAME))
-            struct.set(CLIENT_ID_FIELD_NAME, clientId);
-        struct.set(CORRELATION_ID_FIELD_NAME, correlationId);
-        return struct;
+        return this.data.toStruct(headerVersion);
     }
 
-    public short apiKey() {
-        return apiKey;
+    public ApiKeys apiKey() {
+        return ApiKeys.forId(data.requestApiKey());
     }
 
     public short apiVersion() {
-        return apiVersion;
+        return data.requestApiVersion();
+    }
+
+    public short headerVersion() {
+        return headerVersion;
     }
 
     public String clientId() {
-        return clientId;
+        return data.clientId();
     }
 
     public int correlationId() {
-        return correlationId;
+        return data.correlationId();
+    }
+
+    public RequestHeaderData data() {
+        return data;
     }
 
     public ResponseHeader toResponseHeader() {
-        return new ResponseHeader(correlationId);
+        return new ResponseHeader(data.correlationId(),
+            apiKey().responseHeaderVersion(apiVersion()));
     }
 
     public static RequestHeader parse(ByteBuffer buffer) {
-        short apiKey = buffer.getShort();
-        short apiVersion = buffer.getShort();
-        Schema schema = Protocol.requestHeaderSchema(apiKey, apiVersion);
-        buffer.rewind();
-        return new RequestHeader(schema.read(buffer));
+        short apiKey = -1;
+        try {
+            apiKey = buffer.getShort();
+            short apiVersion = buffer.getShort();
+            short headerVersion = ApiKeys.forId(apiKey).requestHeaderVersion(apiVersion);
+            buffer.rewind();
+            return new RequestHeader(new RequestHeaderData(
+                new ByteBufferAccessor(buffer), headerVersion), headerVersion);
+        } catch (UnsupportedVersionException e) {
+            throw new InvalidRequestException("Unknown API key " + apiKey, e);
+        } catch (Throwable ex) {
+            throw new InvalidRequestException("Error parsing request header. Our best guess of the apiKey is: " +
+                    apiKey, ex);
+        }
     }
 
     @Override
     public String toString() {
-        return toStruct().toString();
+        return "RequestHeader(apiKey=" + apiKey() +
+                ", apiVersion=" + apiVersion() +
+                ", clientId=" + clientId() +
+                ", correlationId=" + correlationId() +
+                ")";
     }
 
     @Override
     public boolean equals(Object o) {
         if (this == o) return true;
         if (o == null || getClass() != o.getClass()) return false;
-
         RequestHeader that = (RequestHeader) o;
-        return apiKey == that.apiKey &&
-                apiVersion == that.apiVersion &&
-                correlationId == that.correlationId &&
-                (clientId == null ? that.clientId == null : clientId.equals(that.clientId));
+        return this.data.equals(that.data);
     }
 
     @Override
     public int hashCode() {
-        int result = (int) apiKey;
-        result = 31 * result + (int) apiVersion;
-        result = 31 * result + (clientId != null ? clientId.hashCode() : 0);
-        result = 31 * result + correlationId;
-        return result;
+        return this.data.hashCode();
     }
-
 }
